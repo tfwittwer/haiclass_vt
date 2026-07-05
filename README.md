@@ -16,7 +16,7 @@ uv sync
 ```
 
 PyTorch comes from the cu128 index on Windows/Linux; on other
-platforms it falls back to the default wheel (CPU / Metal on macOS). Edit `pyproject.toml` if you want another version of PyTorch.
+platforms it falls back to the default wheel (CPU / Metal on macOS). Edit `pyproject.toml` if you want a different version of PyTorch.
 
 ## Usage
 
