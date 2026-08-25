@@ -16,7 +16,7 @@ RUNS_DIR = PROJECTPATH / Path(r"runs")
 @dataclass
 class Config:
     # --- voxels ---
-    voxel_size: float = 0.10
+    voxel_size: float = 0.20
 
     # --- ground grid ---
     ground_cell: float = 1.0

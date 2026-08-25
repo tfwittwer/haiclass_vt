@@ -42,10 +42,15 @@ interruption. Use `--files name` or `--limit N` for partial runs.
 
 The classes that are to be used for object segmentation are defined in `segment.py`. Skip classes like ground here.
 
+## Model Zoo
+
+- [KITTI360](model_zoo/kitti360.pt), trained with 0.2m voxel size.
+
+
 ## Model architecture
 
 The classifier is a plain transformer encoder that runs over voxels instead of
-points or pixels. Each file is reduced to 0.10 m voxels; the voxels are grouped
+points or pixels. Each file is reduced to `voxel_size` voxels (`config.py`; 0.20 m); the voxels are grouped
 into spatial blocks of ≤4096 by recursive median splits in XY, and every block
 is processed independently with full self-attention (so each voxel attends to
 every other voxel within a few tens of metres):
@@ -66,7 +71,7 @@ flowchart TD
         concat["23 features ++ block-relative xyz · 0.05<br/>(26 dims)"]
         embed["embedding<br/>Linear 26→256 · GELU · Linear 256→256"]
         enc["transformer block ×6 (pre-norm)<br/>LayerNorm → 8-head SDPA attention → +residual<br/>LayerNorm → MLP 256→1024→256 (GELU) → +residual<br/>dropout 0.05"]
-        head["head<br/>LayerNorm → Linear 256→19"]
+        head["head<br/>LayerNorm → Linear 256→C classes"]
         concat --> embed --> enc --> head
     end
 
