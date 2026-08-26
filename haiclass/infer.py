@@ -2,6 +2,7 @@
 
 Usage:
     uv run python -m haiclass.infer [--run spt01] [--limit N] [--files NAME ...]
+    uv run python -m haiclass.infer --model model_zoo/kitti360.pt --in DIR --out DIR
 """
 
 from __future__ import annotations
@@ -107,16 +108,52 @@ def classify_file(
     }
 
 
+def resolve_checkpoint(model: str | None, run: str, checkpoint: str) -> Path:
+    """--model wins; otherwise --checkpoint as a path, else runs/<run>/<checkpoint>."""
+    if model:
+        path = Path(model)
+        if path.is_dir():
+            path = path / checkpoint
+    else:
+        path = Path(checkpoint)
+        if not path.is_file():
+            path = RUNS_DIR / run / checkpoint
+    if not path.is_file():
+        raise SystemExit(f"checkpoint not found: {path}")
+    return path
+
+
+def collect_files(source: str, stems: list[str] | None, limit: int | None) -> list[Path]:
+    """`source` is a LAZ/LAS file or a directory to scan."""
+    src = Path(source)
+    if src.is_file():
+        files = [src]
+    elif src.is_dir():
+        files = sorted(f for f in src.iterdir() if f.suffix.lower() in (".laz", ".las"))
+    else:
+        raise SystemExit(f"input not found: {src}")
+    if stems:
+        files = [f for f in files if f.stem in set(stems)]
+    return files[:limit]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", type=str, default="spt01")
-    ap.add_argument("--checkpoint", type=str, default="best.pt")
+    ap.add_argument("--model", type=str, default=None,
+                    help="path to a checkpoint file (overrides --run/--checkpoint)")
+    ap.add_argument("--run", type=str, default="spt01", help=f"run directory under {RUNS_DIR}")
+    ap.add_argument("--checkpoint", type=str, default="best.pt",
+                    help="checkpoint path, or file name inside the run directory")
+    ap.add_argument("--in", dest="input", type=str, default=str(TEST_DIR),
+                    help="input directory or a single LAZ/LAS file")
+    ap.add_argument("--out", type=str, default=str(OUT_DIR), help="output directory")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--files", nargs="*", default=None, help="specific file stems")
-    ap.add_argument("--out", type=str, default=str(OUT_DIR))
+    ap.add_argument("--overwrite", action="store_true", help="re-classify existing outputs")
     args = ap.parse_args()
 
-    ckpt = torch.load(RUNS_DIR / args.run / args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_path = resolve_checkpoint(args.model, args.run, args.checkpoint)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = Config(**{k: v for k, v in ckpt["config"].items() if k in Config.__dataclass_fields__})
     mean, std = ckpt["mean"], ckpt["std"]
 
@@ -124,18 +161,16 @@ def main() -> None:
     model = VoxelTransformer(cfg, len(mean)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    print(f"loaded {args.run}/{args.checkpoint} (epoch {ckpt.get('epoch')}, "
+    print(f"loaded {ckpt_path} (epoch {ckpt.get('epoch')}, "
           f"mIoU {ckpt.get('miou', float('nan')):.4f}), device={device}")
 
-    files = sorted(TEST_DIR.glob("*.laz"))
-    if args.files:
-        files = [f for f in files if f.stem in set(args.files)]
-    files = files[: args.limit]
+    files = collect_files(args.input, args.files, args.limit)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"{len(files)} file(s) from {args.input} -> {out_dir}")
 
     for i, f in enumerate(files, 1):
-        if (out_dir / f.name).exists():
+        if (out_dir / f.name).exists() and not args.overwrite:
             print(f"[{i}/{len(files)}] {f.name} exists, skip")
             continue
         info = classify_file(f, model, cfg, mean, std, device, out_dir)

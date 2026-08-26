@@ -38,7 +38,21 @@ uv run python -m haiclass.segment
 ```
 
 `infer` skips files whose output already exists, so it can be re-run after an
-interruption. Use `--files name` or `--limit N` for partial runs.
+interruption (`--overwrite` forces re-classification). Use `--files name` or
+`--limit N` for partial runs.
+
+The default paths come from `config.py`, but checkpoint, input and output can be
+given directly — no run directory or `best.pt` needed:
+
+```
+uv run python -m haiclass.infer --model model_zoo/kitti360.pt --in /data/tiles --out /data/classified
+uv run python -m haiclass.infer --model model_zoo/kitti360.pt --in /data/tiles/one.laz --out /data/classified
+```
+
+`--model` takes a checkpoint file (or a directory, in which case `--checkpoint`
+names the file inside it); `--in` takes a directory of LAZ/LAS files or a single
+file. Without `--model`, the checkpoint is still resolved as
+`runs/<run>/<checkpoint>`.
 
 The classes that are to be used for object segmentation are defined in `segment.py`. Skip classes like ground here.
 
