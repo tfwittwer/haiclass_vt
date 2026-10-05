@@ -266,30 +266,49 @@ def main() -> None:
     for epoch in range(start_epoch, cfg.epochs + 1):
         t0 = time.time()
         blocks = ds.epoch_blocks(val=False)
-        losses = []
+        losses, ooms = [], 0
         for i in range(0, len(blocks) - cfg.batch_blocks + 1, cfg.batch_blocks):
             feats, coords, labels, pad = ds.collate(blocks[i : i + cfg.batch_blocks], augment=True)
             feats, coords, labels, pad = (
                 feats.to(device), coords.to(device), labels.to(device), pad.to(device),
             )
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = model(feats, coords, pad)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, cfg.num_classes), labels.reshape(-1),
-                    weight=w, ignore_index=-1,
-                )
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            scaler.step(opt)
-            scaler.update()
-            sched.step()
+            try:
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    logits = model(feats, coords, pad)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, cfg.num_classes), labels.reshape(-1),
+                        weight=w, ignore_index=-1,
+                    )
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                scaler.step(opt)
+                scaler.update()
+            except torch.OutOfMemoryError:
+                # the 4090 is shared; a co-tenant spike must not kill the run
+                opt.zero_grad(set_to_none=True)
+                del feats, coords, labels, pad
+                torch.cuda.empty_cache()
+                ooms += 1
+                continue
+            finally:
+                sched.step()
             losses.append(loss.item())
 
         msg = f"epoch {epoch:3d}/{cfg.epochs}  loss={np.mean(losses):.4f}  [{time.time()-t0:.0f}s]"
+        if ooms:
+            msg += f"  ({ooms} batches skipped, OOM)"
+        ev = None
         if epoch % 5 == 0 or epoch == cfg.epochs:
-            ev = evaluate(model, ds, device, cfg)
+            try:
+                ev = evaluate(model, ds, device, cfg)
+            except torch.OutOfMemoryError:
+                # a co-tenant spike during validation must not end the run
+                model.train(); torch.cuda.empty_cache()
+                msg += "  val skipped (OOM)"
+                print(msg)
+        if ev is not None:
             msg += f"  val OA={ev['oa']:.4f} mIoU={ev['miou']:.4f}"
             per = {v: round(float(i), 3) for v, i in zip(cfg.class_values, ev["iou"])}
             print(msg)
@@ -302,7 +321,7 @@ def main() -> None:
                     run_dir / "best.pt",
                 )
                 print(f"   saved best (mIoU={best_miou:.4f})")
-        else:
+        elif "val skipped" not in msg:
             print(msg)
         _save_ckpt(
             {"model": model.state_dict(), "config": asdict(cfg),
