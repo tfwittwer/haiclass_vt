@@ -293,7 +293,10 @@ def main() -> None:
                 ooms += 1
                 continue
             finally:
-                sched.step()
+                # jittered splits vary the block count per epoch, so the fixed
+                # OneCycle budget can run out a few steps early; hold the final lr
+                if sched.last_epoch < sched.total_steps:
+                    sched.step()  # keep the schedule tied to the step count
             losses.append(loss.item())
 
         msg = f"epoch {epoch:3d}/{cfg.epochs}  loss={np.mean(losses):.4f}  [{time.time()-t0:.0f}s]"
