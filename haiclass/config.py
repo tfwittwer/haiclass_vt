@@ -30,6 +30,9 @@ class Config:
 
     # --- blocks ---
     block_target: int = 4096  # voxels per attention block
+    # split plane at quantile 0.5 +- split_jitter, seeded from `shift`. 0 = plain
+    # median, which makes `shift` a no-op (median translates with the data).
+    split_jitter: float = 0.0
 
     # --- model ---
     dim: int = 256
@@ -44,6 +47,7 @@ class Config:
     batch_blocks: int = 8
     val_fraction: float = 0.10
     min_class_voxels: int = 2000  # drop classes with less total support
+    class_weight_c: float = 1.2  # weights = 1/log(c + freq); 1.2 spans 4.3x, 1.02 spans ~50x
     seed: int = 42
 
     # classes are discovered from the training caches; stored on the checkpoint

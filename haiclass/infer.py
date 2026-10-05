@@ -37,7 +37,7 @@ def predict_logits(
     hits = np.zeros(V, dtype=np.float32)
     with torch.no_grad():
         for shift in ((0.0, 0.0), (23.7, 23.7)):
-            blocks = make_blocks(centroid, cfg.block_target, shift=shift)
+            blocks = make_blocks(centroid, cfg.block_target, shift=shift, jitter=cfg.split_jitter)
             for i in range(0, len(blocks), cfg.batch_blocks):
                 chunk = blocks[i : i + cfg.batch_blocks]
                 B = len(chunk)

@@ -82,7 +82,8 @@ class BlockDataset:
         out = []
         for fi, t in enumerate(self.files):
             shift = (0.0, 0.0) if val else tuple(self.rng.uniform(0, 30, 2))
-            for b in make_blocks(t["centroid"], self.cfg.block_target, shift=shift):
+            for b in make_blocks(t["centroid"], self.cfg.block_target, shift=shift,
+                                 jitter=self.cfg.split_jitter):
                 out.append((fi, b))
         if not val:
             self.rng.shuffle(out)
@@ -159,11 +160,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--run", type=str, default="spt01")
+    ap.add_argument("--split-jitter", type=float, default=None)
+    ap.add_argument("--class-weight-c", type=float, default=None)
     args = ap.parse_args()
 
     cfg = Config()
     if args.epochs:
         cfg.epochs = args.epochs
+    if args.split_jitter is not None:
+        cfg.split_jitter = args.split_jitter
+    if args.class_weight_c is not None:
+        cfg.class_weight_c = args.class_weight_c
     rng = np.random.default_rng(cfg.seed)
     torch.manual_seed(cfg.seed)
 
@@ -188,7 +195,7 @@ def main() -> None:
         lab = ds.remap[t["label"]]
         m = lab >= 0
         total += np.bincount(lab[m], minlength=cfg.num_classes)
-    weights = 1.0 / np.log(1.2 + total / total.sum())
+    weights = 1.0 / np.log(cfg.class_weight_c + total / total.sum())
     weights = weights / weights.mean()
     w = torch.tensor(weights, dtype=torch.float32, device=device)
     print("class weights:", np.round(weights, 2))
