@@ -82,7 +82,8 @@ class BlockDataset:
         out = []
         for fi, t in enumerate(self.files):
             shift = (0.0, 0.0) if val else tuple(self.rng.uniform(0, 30, 2))
-            for b in make_blocks(t["centroid"], self.cfg.block_target, shift=shift):
+            for b in make_blocks(t["centroid"], self.cfg.block_target, shift=shift,
+                                 jitter=self.cfg.split_jitter):
                 out.append((fi, b))
         if not val:
             self.rng.shuffle(out)
@@ -126,6 +127,19 @@ class BlockDataset:
         )
 
 
+def _save_ckpt(obj, path, tries=5):
+    """torch.save onto the Azure mount can fail with EAGAIN; retry instead of
+    losing a day-long run to one flaky write."""
+    for attempt in range(tries):
+        try:
+            torch.save(obj, path)
+            return
+        except OSError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+
 def normalize_stats(files: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     sample = np.concatenate([t["features"][:: max(1, len(t["features"]) // 100000)] for t in files])
     mean = sample.mean(axis=0)
@@ -159,11 +173,20 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--run", type=str, default="spt01")
+    ap.add_argument("--split-jitter", type=float, default=None)
+    ap.add_argument("--class-weight-c", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
     cfg = Config()
     if args.epochs:
         cfg.epochs = args.epochs
+    if args.split_jitter is not None:
+        cfg.split_jitter = args.split_jitter
+    if args.class_weight_c is not None:
+        cfg.class_weight_c = args.class_weight_c
+    if args.seed is not None:
+        cfg.seed = args.seed
     rng = np.random.default_rng(cfg.seed)
     torch.manual_seed(cfg.seed)
 
@@ -188,7 +211,7 @@ def main() -> None:
         lab = ds.remap[t["label"]]
         m = lab >= 0
         total += np.bincount(lab[m], minlength=cfg.num_classes)
-    weights = 1.0 / np.log(1.2 + total / total.sum())
+    weights = 1.0 / np.log(cfg.class_weight_c + total / total.sum())
     weights = weights / weights.mean()
     w = torch.tensor(weights, dtype=torch.float32, device=device)
     print("class weights:", np.round(weights, 2))
@@ -206,50 +229,112 @@ def main() -> None:
     np.savez(run_dir / "norm.npz", mean=mean, std=std)
 
     best_miou = 0.0
-    for epoch in range(1, cfg.epochs + 1):
+    start_epoch = 1
+    # Auto-resume: a last.pt in the run dir means this run was interrupted.
+    # Use a fresh --run name for a genuinely fresh start.
+    resume_from = run_dir / "last.pt"
+    if resume_from.exists():
+        ck = torch.load(resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        start_epoch = ck["epoch"] + 1
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+            sched.load_state_dict(ck["sched"])
+            scaler.load_state_dict(ck["scaler"])
+            rng.bit_generator.state = ck["rng"]
+            torch.set_rng_state(ck["torch_rng"].cpu())
+            best_miou = ck["best_miou"]
+        else:
+            # Weights-only checkpoint from before resume support. The schedule
+            # is a pure function of the step count, so fast-forward it; Adam's
+            # moments rebuild within a fraction of an epoch.
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # "step() before optimizer.step()"
+                for _ in range((start_epoch - 1) * steps_per_epoch):
+                    sched.step()
+            best = run_dir / "best.pt"
+            if best.exists():
+                best_miou = torch.load(best, map_location="cpu", weights_only=False)["miou"]
+            print(f"weights-only checkpoint: schedule fast-forwarded to lr={opt.param_groups[0]['lr']:.2e}, "
+                  f"optimizer state fresh")
+        print(f"resuming {run_dir.name} at epoch {start_epoch} (best mIoU={best_miou:.4f})")
+        if start_epoch > cfg.epochs:
+            print(f"done. best val mIoU={best_miou:.4f}  -> {run_dir}")
+            return
+
+    for epoch in range(start_epoch, cfg.epochs + 1):
         t0 = time.time()
         blocks = ds.epoch_blocks(val=False)
-        losses = []
+        losses, ooms = [], 0
         for i in range(0, len(blocks) - cfg.batch_blocks + 1, cfg.batch_blocks):
             feats, coords, labels, pad = ds.collate(blocks[i : i + cfg.batch_blocks], augment=True)
             feats, coords, labels, pad = (
                 feats.to(device), coords.to(device), labels.to(device), pad.to(device),
             )
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = model(feats, coords, pad)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, cfg.num_classes), labels.reshape(-1),
-                    weight=w, ignore_index=-1,
-                )
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            scaler.step(opt)
-            scaler.update()
-            sched.step()
+            try:
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    logits = model(feats, coords, pad)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, cfg.num_classes), labels.reshape(-1),
+                        weight=w, ignore_index=-1,
+                    )
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                scaler.step(opt)
+                scaler.update()
+            except torch.OutOfMemoryError:
+                # the 4090 is shared; a co-tenant spike must not kill the run
+                opt.zero_grad(set_to_none=True)
+                del feats, coords, labels, pad
+                torch.cuda.empty_cache()
+                ooms += 1
+                continue
+            finally:
+                # jittered splits vary the block count per epoch, so the fixed
+                # OneCycle budget can run out a few steps early; hold the final lr
+                if sched.last_epoch < sched.total_steps:
+                    sched.step()  # keep the schedule tied to the step count
             losses.append(loss.item())
 
         msg = f"epoch {epoch:3d}/{cfg.epochs}  loss={np.mean(losses):.4f}  [{time.time()-t0:.0f}s]"
+        if ooms:
+            msg += f"  ({ooms} batches skipped, OOM)"
+        ev = None
         if epoch % 5 == 0 or epoch == cfg.epochs:
-            ev = evaluate(model, ds, device, cfg)
+            try:
+                ev = evaluate(model, ds, device, cfg)
+            except torch.OutOfMemoryError:
+                # a co-tenant spike during validation must not end the run
+                model.train(); torch.cuda.empty_cache()
+                msg += "  val skipped (OOM)"
+                print(msg)
+        if ev is not None:
             msg += f"  val OA={ev['oa']:.4f} mIoU={ev['miou']:.4f}"
             per = {v: round(float(i), 3) for v, i in zip(cfg.class_values, ev["iou"])}
             print(msg)
             print(f"   per-class IoU: {per}")
             if ev["miou"] > best_miou:
                 best_miou = ev["miou"]
-                torch.save(
+                _save_ckpt(
                     {"model": model.state_dict(), "config": asdict(cfg),
                      "mean": mean, "std": std, "epoch": epoch, "miou": best_miou},
                     run_dir / "best.pt",
                 )
                 print(f"   saved best (mIoU={best_miou:.4f})")
-        else:
+        elif "val skipped" not in msg:
             print(msg)
-        torch.save(
+        _save_ckpt(
             {"model": model.state_dict(), "config": asdict(cfg),
-             "mean": mean, "std": std, "epoch": epoch},
+             "mean": mean, "std": std, "epoch": epoch,
+             # Optimizer, schedule and RNG too, so an interrupted run resumes
+             # instead of starting over. Weights alone are not enough: reloading
+             # them into a fresh OneCycleLR restarts the warm-up at full LR.
+             "opt": opt.state_dict(), "sched": sched.state_dict(),
+             "scaler": scaler.state_dict(), "best_miou": best_miou,
+             "rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state()},
             run_dir / "last.pt",
         )
 
