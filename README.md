@@ -27,8 +27,9 @@ Paths, voxel size, and other parameters are defined in `config.py`. Training dat
 # 1. cache voxel features for the labelled training files
 uv run python -m haiclass.precompute
 
-# 2. train (checkpoints + metrics under runs\<run>)
-uv run python -m haiclass.train --run vt01
+# 2. train (checkpoints + metrics under runs\<run>); --split-jitter 0.1 enables
+#    jittered block splits (config default 0 = off), +4 mIoU on KITTI360
+uv run python -m haiclass.train --run vt01 --split-jitter 0.1
 
 # 3. classify the files in the input directory → out
 uv run python -m haiclass.infer --run vt01
@@ -58,7 +59,14 @@ The classes that are to be used for object segmentation are defined in `segment.
 
 ## Model Zoo
 
-- [KITTI360](model_zoo/kitti360.pt), trained with 0.2m voxel size.
+- [KITTI360](model_zoo/kitti360.pt), trained with 0.2m voxel size. Val mIoU 51.3%.
+- [KITTI360 v2](model_zoo/kitti360_v2.pt), trained with 0.2m voxel size and
+  `--split-jitter 0.1` (jittered block splits). Val mIoU 55.5%, OA 92.3%.
+
+Both KITTI360 models output the KITTI-360 benchmark class ids (2 road,
+3 sidewalk, 4 building, 5 wall, 6 fence, 7 pole, 8 traffic light,
+9 traffic sign, 10 vegetation, 11 terrain, 12 person, 13 car, 14 truck,
+15 motorcycle, 16 bicycle), not ASPRS LAS classes.
 
 
 ## Model architecture
